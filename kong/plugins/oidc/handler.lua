@@ -1,191 +1,122 @@
-local OidcHandler = {
-    VERSION = "1.3.0",
-    PRIORITY = 1000,
-}
-local utils = require("kong.plugins.oidc.utils")
+-- local BasePlugin = require "kong.plugins.base_plugin"
+-- local OidcHandler = BasePlugin:extend()
+
+local csrf = require("kong.plugins.oidc.csrf")
 local filter = require("kong.plugins.oidc.filter")
+local multitenancy = require("kong.plugins.oidc.multitenancy")
+local routes = require("kong.plugins.oidc.routes")
 local session = require("kong.plugins.oidc.session")
+local token_validator = require("kong.plugins.oidc.token_validator")
+local utils = require("kong.plugins.oidc.utils")
+
+-- OidcHandler.PRIORITY = 1000
+
+-- function OidcHandler:new()
+--   OidcHandler.super.new(self, "oidc")
+-- end
+
+local OidcHandler = {
+  VERSION = "1.0.0",
+  PRIORITY = 1000,
+}
 
 
 function OidcHandler:access(config)
+  -- OidcHandler.super.access(self)
   local oidcConfig = utils.get_options(config, ngx)
 
-  -- partial support for plugin chaining: allow skipping requests, where higher priority
-  -- plugin has already set the credentials. The 'config.anomyous' approach to define
-  -- "and/or" relationship between auth plugins is not utilized
-  if oidcConfig.skip_already_auth_requests and kong.client.get_credential() then
-    ngx.log(ngx.DEBUG, "OidcHandler ignoring already auth request: " .. ngx.var.request_uri)
+  if is_not_empty(config.header_x_frame_options) then
+    ngx.header["x-frame-options"] = config.header_x_frame_options
+  end
+  if is_not_empty(config.header_x_xss_protection) then
+    ngx.header["X-XSS-Protection"] = config.header_x_xss_protection
+  end
+  if is_not_empty(config.header_x_content_type_options) then
+    ngx.header["X-Content-Type-Options"] = config.header_x_content_type_options
+  end
+  if is_not_empty(config.header_strict_transport_security) then
+    ngx.header["Strict-Transport-Security"] = config.header_strict_transport_security
+  end
+  if config.add_header_content_security_policy and is_not_empty(config.header_content_security_policy) then
+    ngx.header["Content-Security-Policy"] = config.header_content_security_policy
+  end
+
+  if is_not_empty(config.header_referrer_policy) then
+    ngx.header["Referrer-Policy"] = config.header_referrer_policy
+  end
+
+  if ngx.var.uri == (config.logout_path or "/logout") then
+    ngx.header["Clear-Site-Data"] = config.header_clear_site_data
+  end
+
+  if filter.shouldIgnoreRequest(oidcConfig) then
+    kong.log.debug("OidcHandler ignoring request, path: " .. ngx.var.request_uri)
+    kong.log.debug("OidcHandler done")
     return
   end
 
-  if filter.shouldProcessRequest(oidcConfig) then
-    session.configure(config)
-    handle(oidcConfig)
-  else
-    ngx.log(ngx.DEBUG, "OidcHandler ignoring request, path: " .. ngx.var.request_uri)
+  if routes.shouldIgnoreRoute(oidcConfig) then
+    kong.log.debug("OidcHandler ignoring route: " .. kong.router.get_route().name)
+    kong.log.debug("OidcHandler done")
+    return
   end
 
-  ngx.log(ngx.DEBUG, "OidcHandler done")
+  session.configure(config)
+  oidc(oidcConfig)
+
+  kong.log.debug("OidcHandler done")
 end
 
-function handle(oidcConfig)
-  local response
+function oidc(oidcConfig)
+  
+  oidcConfig.lifecycle = { on_authenticated = on_authenticated }
+  kong.log.debug("OidcHandler calling authenticate, requested path: " .. ngx.var.request_uri)
+  local unauth_action = nil
 
-  if oidcConfig.bearer_jwt_auth_enable then
-    response = verify_bearer_jwt(oidcConfig)
-    if response then
-      utils.setCredentials(response)
-      utils.injectGroups(response, oidcConfig.groups_claim)
-      utils.injectHeaders(oidcConfig.header_names, oidcConfig.header_claims, { response })
-      if not oidcConfig.disable_userinfo_header then
-        utils.injectUser(response, oidcConfig.userinfo_header_name)
-      end
-      return
-    end
+  if oidcConfig.bearer_only == "yes" then
+    kong.log.debug("set unauthaction to pass")
+    unauth_action = "pass"
   end
-
-  if oidcConfig.introspection_endpoint then
-    response = introspect(oidcConfig)
-    if response then
-      utils.setCredentials(response)
-      utils.injectGroups(response, oidcConfig.groups_claim)
-      utils.injectHeaders(oidcConfig.header_names, oidcConfig.header_claims, { response })
-      if not oidcConfig.disable_userinfo_header then
-        utils.injectUser(response, oidcConfig.userinfo_header_name)
-      end
-    end
-  end
-
-  if response == nil then
-    response = make_oidc(oidcConfig)
-    if response then
-      if response.user or response.id_token then
-        -- is there any scenario where lua-resty-openidc would not provide id_token?
-        utils.setCredentials(response.user or response.id_token)
-      end
-      if response.user and response.user[oidcConfig.groups_claim]  ~= nil then
-        utils.injectGroups(response.user, oidcConfig.groups_claim)
-      elseif response.id_token then
-        utils.injectGroups(response.id_token, oidcConfig.groups_claim)
-      end
-      utils.injectHeaders(oidcConfig.header_names, oidcConfig.header_claims, { response.user, response.id_token })
-      if (not oidcConfig.disable_userinfo_header
-          and response.user) then
-        utils.injectUser(response.user, oidcConfig.userinfo_header_name)
-      end
-      if (not oidcConfig.disable_access_token_header
-          and response.access_token) then
-        utils.injectAccessToken(response.access_token, oidcConfig.access_token_header_name, oidcConfig.access_token_as_bearer)
-      end
-      if (not oidcConfig.disable_id_token_header
-          and response.id_token) then
-        utils.injectIDToken(response.id_token, oidcConfig.id_token_header_name)
-      end
-    end
-  end
-end
-
-function make_oidc(oidcConfig)
-  ngx.log(ngx.DEBUG, "OidcHandler calling authenticate, requested path: " .. ngx.var.request_uri)
-  local unauth_action = oidcConfig.unauth_action
-  if unauth_action ~= "auth" then
-    -- constant for resty.oidc library
-    unauth_action = "deny"
-  end
-  local res, err = require("resty.openidc").authenticate(oidcConfig, ngx.var.request_uri, unauth_action)
+  
+  local res, err = require("resty.openidc").authenticate(oidcConfig, nil, unauth_action)
 
   if err then
-    if err == 'unauthorized request' then
-      return kong.response.error(ngx.HTTP_UNAUTHORIZED)
-    else
-      if oidcConfig.recovery_page_path then
-    	  ngx.log(ngx.DEBUG, "Redirecting to recovery page: " .. oidcConfig.recovery_page_path)
-        ngx.redirect(oidcConfig.recovery_page_path)
-      end
-      return kong.response.error(ngx.HTTP_INTERNAL_SERVER_ERROR)
+    kong.log.warn("OidcHandler authenticate failed: " .. err)
+    if oidcConfig.bearer_only == "yes" then
+      kong.log.debug("skipping redirect, bearer only enabled")
+      ngx.exit(200, err, ngx.HTTP_OK)
     end
+    if oidcConfig.recovery_page_path then
+      kong.log.debug("Entering recovery page: " .. oidcConfig.recovery_page_path)
+      ngx.redirect(oidcConfig.recovery_page_path)
+    end
+    utils.exit(500, err, ngx.HTTP_INTERNAL_SERVER_ERROR)
+  end
+  
+  if not res and oidcConfig.bearer_only == "yes" then
+    kong.response.clear_header("Set-Cookie")
+  end
+
+  if (oidcConfig.forward_bearer_access_token == "yes") then
+    enhance_response(res, oidcConfig)
   end
   return res
 end
 
-function introspect(oidcConfig)
-  if utils.has_bearer_access_token() or oidcConfig.bearer_only == "yes" then
-    local res, err
-    if oidcConfig.use_jwks == "yes" then
-      res, err = require("resty.openidc").bearer_jwt_verify(oidcConfig)
-    else
-      res, err = require("resty.openidc").introspect(oidcConfig)
-    end
-    if err then
-      if oidcConfig.bearer_only == "yes" then
-        ngx.header["WWW-Authenticate"] = 'Bearer realm="' .. oidcConfig.realm .. '",error="' .. err .. '"'
-        return kong.response.error(ngx.HTTP_UNAUTHORIZED)
-      end
-      return nil
-    end
-    if oidcConfig.validate_scope == "yes" then
-      local validScope = false
-      if res.scope then
-        for scope in res.scope:gmatch("([^ ]+)") do
-          if scope == oidcConfig.scope then
-            validScope = true
-            break
-          end
-        end
-      end
-      if not validScope then
-        kong.log.err("Scope validation failed")
-        return kong.response.error(ngx.HTTP_FORBIDDEN)
-      end
-    end
-    ngx.log(ngx.DEBUG, "OidcHandler introspect succeeded, requested path: " .. ngx.var.request_uri)
-    return res
-  end
-  return nil
+function on_authenticated(session)
+  csrf.set(session)
+  session.data.selected_tenant_force = "false"
 end
 
-function verify_bearer_jwt(oidcConfig)
-  if not utils.has_bearer_access_token() then
-    return nil
+function enhance_response(response, oidcConfig)
+  if not response then return end
+  if (response.access_token) then
+      utils.injectBearerAccessToken(response.access_token)
   end
-  -- setup controlled configuration for bearer_jwt_verify
-  local opts = {
-    accept_none_alg = false,
-    accept_unsupported_alg = false,
-    token_signing_alg_values_expected = oidcConfig.bearer_jwt_auth_signing_algs,
-    discovery = oidcConfig.discovery,
-    timeout = oidcConfig.timeout,
-    ssl_verify = oidcConfig.ssl_verify
-  }
+end
 
-  local discovery_doc, err = require("resty.openidc").get_discovery_doc(opts)
-  if err then
-    kong.log.err('Discovery document retrieval for Bearer JWT verify failed')
-    return nil
-  end
-
-  local allowed_auds = oidcConfig.bearer_jwt_auth_allowed_auds or oidcConfig.client_id
-
-  local jwt_validators = require "resty.jwt-validators"
-  jwt_validators.set_system_leeway(120)
-  local claim_spec = {
-    -- mandatory for id token: iss, sub, aud, exp, iat
-    iss = jwt_validators.equals(discovery_doc.issuer),
-    sub = jwt_validators.required(),
-    aud = function(val) return utils.has_common_item(val, allowed_auds) end,
-    exp = jwt_validators.is_not_expired(),
-    iat = jwt_validators.required(),
-    -- optional validations
-    nbf = jwt_validators.opt_is_not_before(),
-  }
-
-  local json, err, token = require("resty.openidc").bearer_jwt_verify(opts, claim_spec)
-  if err then
-    kong.log.err('Bearer JWT verify failed: ' .. err)
-    return nil
-  end
-
-  return json
+function is_not_empty(stringToCheck)
+  return not (stringToCheck == nil and stringToCheck == '')
 end
 
 return OidcHandler
