@@ -21,9 +21,7 @@ description = {
     homepage = "https://github.com/nokia/kong-oidc",
     license = "Apache 2.0"
 }
-dependencies = {
-    "lua-resty-openidc ~> 1.7.6-3"
-}
+
 build = {
     type = "builtin",
     modules = {
